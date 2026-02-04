@@ -265,13 +265,16 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, masks_folde
                 if masks_folder is not None:
                     mask_path = os.path.join(masks_folder, colmap_image_name, frame_basename)
                     if os.path.exists(mask_path):
-                        mask_img = Image.open(mask_path)
-                        im_data = np.array(image.convert("RGBA"))
+                        # Load mask from separate file and use it to composite
+                        mask_img = Image.open(mask_path).convert("L")  # Convert to grayscale
+                        mask_array = np.array(mask_img) / 255.0
+                        mask = mask_array[..., np.newaxis]  # Add channel dimension
+                        
+                        # Apply mask to image with background
                         bg = np.array([1, 1, 1]) if white_background else np.array([0, 0, 0])
-                        norm_data = im_data / 255.0
-                        mask = norm_data[..., 3:4]
-                        arr = norm_data[:, :, :3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
-                        image = Image.fromarray(np.array(arr * 255.0, dtype=np.byte), "RGB")
+                        im_data = np.array(image.convert("RGB")) / 255.0
+                        arr = im_data * mask + bg * (1 - mask)
+                        image = Image.fromarray(np.array(arr * 255.0, dtype=np.uint8), "RGB")
                 
                 # Create CameraInfo (Reuse R, T, K from the static COLMAP view)
                 cam_info = CameraInfo(
@@ -295,13 +298,16 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, masks_folde
                     mask_name = extr.name[1:] if extr.name.startswith('/') else extr.name
                     mask_path = os.path.join(masks_folder, mask_name)
                     if os.path.exists(mask_path):
-                        mask_img = Image.open(mask_path)
-                        im_data = np.array(image.convert("RGBA"))
+                        # Load mask from separate file and use it to composite
+                        mask_img = Image.open(mask_path).convert("L")  # Convert to grayscale
+                        mask_array = np.array(mask_img) / 255.0
+                        mask = mask_array[..., np.newaxis]  # Add channel dimension
+                        
+                        # Apply mask to image with background
                         bg = np.array([1, 1, 1]) if white_background else np.array([0, 0, 0])
-                        norm_data = im_data / 255.0
-                        mask = norm_data[..., 3:4]
-                        arr = norm_data[:, :, :3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
-                        image = Image.fromarray(np.array(arr * 255.0, dtype=np.byte), "RGB")
+                        im_data = np.array(image.convert("RGB")) / 255.0
+                        arr = im_data * mask + bg * (1 - mask)
+                        image = Image.fromarray(np.array(arr * 255.0, dtype=np.uint8), "RGB")
                 
                 # Robust timestamp parsing
                 number_sequences = re.findall(r'(\d+)', image_name)
