@@ -54,6 +54,7 @@ class Scene:
                 load_time_step=args.load_time_step,
                 load_every_nth=args.load_every_nth,
                 pc_path=args.pc_path,
+                train_cam_names=args.train_cam_names,
             )
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")

@@ -71,7 +71,7 @@ class ModelParams(ParamGroup):
         self.n_views = 6
         self.num_pts = 100_000
         self.pts_samples = 'depth'
-        self.train_cam_names = ['cam_train_0', 'cam_train_1', 'cam_train_2', 'cam_train_3', 'cam_train_4', 'cam_train_5', 'cam_train_6', 'cam_train_7', 'cam_train_8', 'cam_train_9']
+        self.train_cam_names = []
         self.test_cam_names = ['cam_test']
         self.pred_cam_names = ['cam_test']
 

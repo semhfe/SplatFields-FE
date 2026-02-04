@@ -11,6 +11,7 @@
 
 import os
 import sys
+import re
 import trimesh
 import torch
 import tempfile
@@ -163,13 +164,45 @@ def getNerfppNorm(cam_info):
 
 
 def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, masks_folder=None, white_background=False):
+    """
+    Read COLMAP cameras with support for video folder expansion.
+    
+    If a COLMAP image name (e.g., "image01") corresponds to a folder in images_folder
+    containing video frames, this function expands it into multiple CameraInfo entries.
+    
+    Expected structure for video mode:
+    - images_folder/image01/frame_00001.png, frame_00002.png, ...
+    - images_folder/image02/frame_00001.png, frame_00002.png, ...
+    
+    For single-image mode (backward compatible):
+    - images_folder/image01.png
+    """
     cam_infos = []
-    num_frames = len(cam_extrinsics)
+    
+    # First pass: count total frames to calculate proper fid values
+    total_video_frames = 0
+    video_folders_info = {}
+    
+    for key in sorted(cam_extrinsics):
+        extr = cam_extrinsics[key]
+        colmap_image_name = os.path.splitext(os.path.basename(extr.name))[0]
+        image_dir = os.path.join(images_folder, colmap_image_name)
+        
+        if os.path.isdir(image_dir):
+            frame_files = sorted(glob(os.path.join(image_dir, "*.png")) + 
+                                glob(os.path.join(image_dir, "*.jpg")) +
+                                glob(os.path.join(image_dir, "*.jpeg")))
+            if frame_files:
+                video_folders_info[colmap_image_name] = frame_files
+                total_video_frames = max(total_video_frames, len(frame_files))
+    
+    # Use total_video_frames for fid calculation if video mode, else use num_extrinsics
+    num_frames_for_fid = total_video_frames if total_video_frames > 0 else len(cam_extrinsics)
+    fid_denominator = max(1, num_frames_for_fid - 1)
+    
     for idx, key in enumerate(sorted(cam_extrinsics)):
         sys.stdout.write('\r')
-        # the exact output you're looking for:
-        sys.stdout.write(
-            "Reading camera {}/{}".format(idx + 1, len(cam_extrinsics)))
+        sys.stdout.write("Reading camera {}/{}".format(idx + 1, len(cam_extrinsics)))
         sys.stdout.flush()
 
         extr = cam_extrinsics[key]
@@ -193,32 +226,108 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, masks_folde
         else:
             assert False, "Colmap camera model not handled: only undistorted datasets (PINHOLE or SIMPLE_PINHOLE cameras) supported!"
 
-        image_path = os.path.join(images_folder, os.path.basename(extr.name))
-        image_name = os.path.basename(image_path).split(".")[0]
-        image = Image.open(image_path)
-        if masks_folder is not None:
-            mask_name = extr.name[1:]
-            mask_path = os.path.join(masks_folder, mask_name)
-            mask = Image.open(mask_path)
-            im_data = np.array(image.convert("RGBA"))
-
-            bg = np.array([1, 1, 1]) if white_background else np.array([0, 0, 0])
-
-            norm_data = im_data / 255.0
-            mask = norm_data[..., 3:4]
-
-            arr = norm_data[:, :, :3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
-            image = Image.fromarray(np.array(arr * 255.0, dtype=np.byte), "RGB")
+        # Get the pure name from COLMAP extrinsic (e.g., "image01")
+        colmap_image_name = os.path.splitext(os.path.basename(extr.name))[0]
+        
+        # Check if a folder with this name exists in the images_folder
+        image_dir = os.path.join(images_folder, colmap_image_name)
+        
+        if os.path.isdir(image_dir):
+            # === VIDEO EXPANSION MODE ===
+            # Load all frames in the folder (e.g., frame_00001.png, frame_00002.png)
+            frame_files = sorted(glob(os.path.join(image_dir, "*.png")) + 
+                                glob(os.path.join(image_dir, "*.jpg")) +
+                                glob(os.path.join(image_dir, "*.jpeg")))
+            
+            if not frame_files:
+                print(f"\n  Warning: Video folder {image_dir} is empty, skipping...")
+                continue
+            
+            for frame_path in frame_files:
+                frame_basename = os.path.basename(frame_path)
+                frame_name = os.path.splitext(frame_basename)[0]
+                
+                # Robust FID (Time) Parsing from "frame_00001"
+                matches = re.findall(r'(\d+)', frame_name)
+                fid = 0.0
+                if matches:
+                    frame_index = int(matches[-1])
+                    fid = frame_index / fid_denominator
+                
+                # Construct unique hierarchical image name: "image01/frame_00001"
+                unique_image_name = f"{colmap_image_name}/{frame_name}"
+                
+                # Load the image
+                image = Image.open(frame_path)
+                
+                # Handle masks if provided
+                mask = None
+                if masks_folder is not None:
+                    mask_path = os.path.join(masks_folder, colmap_image_name, frame_basename)
+                    if os.path.exists(mask_path):
+                        # Load mask from separate file and use it to composite
+                        mask_img = Image.open(mask_path).convert("L")  # Convert to grayscale
+                        mask_array = np.array(mask_img) / 255.0
+                        mask = mask_array[..., np.newaxis]  # Add channel dimension
+                        
+                        # Apply mask to image with background
+                        bg = np.array([1, 1, 1]) if white_background else np.array([0, 0, 0])
+                        im_data = np.array(image.convert("RGB")) / 255.0
+                        arr = im_data * mask + bg * (1 - mask)
+                        image = Image.fromarray(np.array(arr * 255.0, dtype=np.uint8), "RGB")
+                
+                # Create CameraInfo (Reuse R, T, K from the static COLMAP view)
+                cam_info = CameraInfo(
+                    uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
+                    image_path=frame_path, image_name=unique_image_name, 
+                    width=width, height=height, fid=fid, mask=mask
+                )
+                cam_infos.append(cam_info)
         else:
-            mask = None
-
-        try:
-            fid = int(image_name) / (num_frames - 1)
-        except:
-            fid = 0
-        cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                              image_path=image_path, image_name=image_name, width=width, height=height, fid=fid, mask=mask)
-        cam_infos.append(cam_info)
+            # === SINGLE IMAGE MODE (backward compatible) or SKIP EXTRA VIEWS ===
+            # Check if single image file exists
+            single_image_path = os.path.join(images_folder, os.path.basename(extr.name))
+            
+            if os.path.exists(single_image_path):
+                # Single image mode - backward compatible
+                image_name = os.path.splitext(os.path.basename(single_image_path))[0]
+                image = Image.open(single_image_path)
+                
+                mask = None
+                if masks_folder is not None:
+                    mask_name = extr.name[1:] if extr.name.startswith('/') else extr.name
+                    mask_path = os.path.join(masks_folder, mask_name)
+                    if os.path.exists(mask_path):
+                        # Load mask from separate file and use it to composite
+                        mask_img = Image.open(mask_path).convert("L")  # Convert to grayscale
+                        mask_array = np.array(mask_img) / 255.0
+                        mask = mask_array[..., np.newaxis]  # Add channel dimension
+                        
+                        # Apply mask to image with background
+                        bg = np.array([1, 1, 1]) if white_background else np.array([0, 0, 0])
+                        im_data = np.array(image.convert("RGB")) / 255.0
+                        arr = im_data * mask + bg * (1 - mask)
+                        image = Image.fromarray(np.array(arr * 255.0, dtype=np.uint8), "RGB")
+                
+                # Robust timestamp parsing
+                number_sequences = re.findall(r'(\d+)', image_name)
+                if number_sequences:
+                    frame_index = int(number_sequences[-1])
+                    fid = frame_index / fid_denominator
+                else:
+                    fid = 0
+                
+                cam_info = CameraInfo(
+                    uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
+                    image_path=single_image_path, image_name=image_name, 
+                    width=width, height=height, fid=fid, mask=mask
+                )
+                cam_infos.append(cam_info)
+            else:
+                # Skip extra views that don't have video folders or single images
+                print(f"\n  Skipping COLMAP view '{colmap_image_name}' - no matching video folder or image file")
+                continue
+    
     sys.stdout.write('\n')
     return cam_infos
 
@@ -277,50 +386,102 @@ def read_colmap_poses(path, images, white_background):
     cam_pos = np.stack(camera_pose)
     return cam_infos_unsorted, cam_pos
 
-def readColmapSceneInfoSparse(path, images, eval, white_background, llffhold=8, num_pts=300_000, pc_path='', load_time_step=10000, load_every_nth=-1, n_views=6):
+def readColmapSceneInfoSparse(path, images, eval, white_background, llffhold=8, num_pts=300_000, pc_path='', load_time_step=10000, load_every_nth=-1, n_views=6, train_cam_names=None):
+    """
+    Read Colmap scene info with support for explicit camera name filtering.
+    
+    Args:
+        path: Path to the dataset.
+        images: Images folder name.
+        eval: Whether to use eval mode.
+        white_background: Use white background for images.
+        llffhold: LLFF holdout value for train/test split.
+        num_pts: Number of points to subsample.
+        pc_path: Path to external point cloud file (optional).
+        load_time_step: Maximum time step to load.
+        load_every_nth: Load every nth image.
+        n_views: Number of views for default subsampling (used only when train_cam_names is not provided).
+        train_cam_names: List of camera names to use for training (optional). 
+                         When provided and non-empty, ONLY these cameras are used for training,
+                         ignoring n_views parameter.
+    """
     cam_infos_unsorted, _cam_pose = read_colmap_poses(path, images, white_background)
-    # pixel nerf split
-    train_idx = [25, 22, 28, 40, 44, 48, 0, 8, 13]
-    exclude_idx = [3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 36, 37, 38, 39]
-    test_idx = [i for i in np.arange(49) if i not in train_idx + exclude_idx]
-    split_indices = {'test': test_idx, 'train': train_idx}
-
-    # selected_idxs = sorted(kmeans_downsample(_cam_pose, n_views))
-    selected_idxs = split_indices['train'][:n_views]
-    print('training camera ids', selected_idxs, ':', [cam_infos_unsorted[c].image_name for c in selected_idxs])
-
+    
     train_cam_infos, test_cam_infos = [], []
-    for ind in range(len(cam_infos_unsorted)):
-        if ind in selected_idxs:
-            train_cam_infos.append(cam_infos_unsorted[ind])
-        elif ind in test_idx:
-            test_cam_infos.append(cam_infos_unsorted[ind])
+    
+    # Check if explicit camera names are provided
+    if train_cam_names is not None and len(train_cam_names) > 0:
+        # Use explicit camera name filtering with prefix matching for hierarchical names
+        # e.g., train_cam_names=["image01"] will match "image01/frame_00001", "image01/frame_00002", etc.
+        print(f"Using explicit camera name filtering with {len(train_cam_names)} camera prefixes: {train_cam_names}")
+        
+        def matches_train_cam(image_name, train_names):
+            """Check if image_name starts with any of the train camera name prefixes."""
+            for prefix in train_names:
+                if image_name.startswith(prefix):
+                    return True
+            return False
+        
+        # Filter cameras based on prefix matching
+        for cam in cam_infos_unsorted:
+            if matches_train_cam(cam.image_name, train_cam_names):
+                train_cam_infos.append(cam)
+            else:
+                test_cam_infos.append(cam)
+        
+        print(f'Training cameras (by prefix match): {[c.image_name for c in train_cam_infos[:10]]}{"..." if len(train_cam_infos) > 10 else ""}')
+    else:
+        # Fallback: Use n_views based subsampling (default behavior)
+        # Use kmeans-based selection for better camera distribution
+        if n_views > 0 and n_views < len(cam_infos_unsorted):
+            selected_idxs = sorted(kmeans_downsample(_cam_pose, n_views))
+        else:
+            selected_idxs = list(range(len(cam_infos_unsorted)))
+        
+        print('training camera ids', selected_idxs, ':', [cam_infos_unsorted[c].image_name for c in selected_idxs])
+        
+        for ind in range(len(cam_infos_unsorted)):
+            if ind in selected_idxs:
+                train_cam_infos.append(cam_infos_unsorted[ind])
+            else:
+                test_cam_infos.append(cam_infos_unsorted[ind])
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
     ply_path = os.path.join(path, "sparse/0/points3D.ply")
     bin_path = os.path.join(path, "sparse/0/points3D.bin")
     txt_path = os.path.join(path, "sparse/0/points3D.txt")
-    if pc_path is not None and pc_path != '':
-        assert os.path.exists(pc_path), f"Path {pc_path} does not exist"
+    
+    # Robust point cloud loading
+    if pc_path and os.path.exists(pc_path):
+        # Load external point cloud
+        print(f"Loading point cloud from external path: {pc_path}")
         xyz = np.asarray(trimesh.load(pc_path).vertices)
         # remove points that are outside -1,1 range
         xyz = xyz[np.all(np.abs(xyz) < 1, axis=1)]
-        # subsample vertices to 100000 points
+        # subsample vertices to num_pts points
         if num_pts > 0 and xyz.shape[0] > num_pts:
             xyz = xyz[np.random.choice(xyz.shape[0], num_pts, replace=False)]
         colors = np.random.random((xyz.shape[0], 3)) / 255.0
     else:
-        print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+        # Try to load standard Colmap point cloud files
+        print("Loading point cloud from standard Colmap files...")
         try:
-            xyz, colors, _ = read_points3D_binary(bin_path)
-        except:
-            xyz, colors, _ = read_points3D_text(txt_path)
-        # storePly(ply_path, xyz, rgb)
-    # try:
-    #     pcd = fetchPly(ply_path)
-    # except:
-    #     pcd = None
+            if os.path.exists(bin_path):
+                xyz, colors, _ = read_points3D_binary(bin_path)
+                print(f"Loaded {len(xyz)} points from points3D.bin")
+            elif os.path.exists(txt_path):
+                xyz, colors, _ = read_points3D_text(txt_path)
+                print(f"Loaded {len(xyz)} points from points3D.txt")
+            else:
+                raise FileNotFoundError(f"No Colmap points3D file found at {bin_path} or {txt_path}")
+        except Exception as e:
+            print(f"Warning: Could not load standard Colmap point cloud: {e}")
+            # If external pc_path was provided but doesn't exist, raise error
+            if pc_path is not None and pc_path != '':
+                raise FileNotFoundError(f"External point cloud path specified but does not exist: {pc_path}")
+            raise
+    
     pcd = BasicPointCloud(points=xyz, colors=colors, normals=np.zeros_like(xyz))
     storePly(ply_path, xyz, colors)
     pcd = fetchPly(ply_path)
