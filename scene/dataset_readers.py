@@ -329,7 +329,7 @@ def readColmapSceneInfoSparse(path, images, eval, white_background, llffhold=8, 
         else:
             selected_idxs = list(range(len(cam_infos_unsorted)))
         
-        print('training camera ids', selected_idxs, ':', [cam_infos_unsorted[c].image_name for c in selected_idxs if c < len(cam_infos_unsorted)])
+        print('training camera ids', selected_idxs, ':', [cam_infos_unsorted[c].image_name for c in selected_idxs])
         
         for ind in range(len(cam_infos_unsorted)):
             if ind in selected_idxs:
@@ -344,7 +344,7 @@ def readColmapSceneInfoSparse(path, images, eval, white_background, llffhold=8, 
     txt_path = os.path.join(path, "sparse/0/points3D.txt")
     
     # Robust point cloud loading
-    if pc_path is not None and pc_path != '' and os.path.exists(pc_path):
+    if pc_path and os.path.exists(pc_path):
         # Load external point cloud
         print(f"Loading point cloud from external path: {pc_path}")
         xyz = np.asarray(trimesh.load(pc_path).vertices)
