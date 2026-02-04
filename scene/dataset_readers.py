@@ -164,15 +164,45 @@ def getNerfppNorm(cam_info):
 
 
 def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, masks_folder=None, white_background=False):
+    """
+    Read COLMAP cameras with support for video folder expansion.
+    
+    If a COLMAP image name (e.g., "image01") corresponds to a folder in images_folder
+    containing video frames, this function expands it into multiple CameraInfo entries.
+    
+    Expected structure for video mode:
+    - images_folder/image01/frame_00001.png, frame_00002.png, ...
+    - images_folder/image02/frame_00001.png, frame_00002.png, ...
+    
+    For single-image mode (backward compatible):
+    - images_folder/image01.png
+    """
     cam_infos = []
-    num_frames = len(cam_extrinsics)
-    # Pre-compute the denominator for fid calculation (avoid redundant computation in loop)
-    fid_denominator = max(1, num_frames - 1)
+    
+    # First pass: count total frames to calculate proper fid values
+    total_video_frames = 0
+    video_folders_info = {}
+    
+    for key in sorted(cam_extrinsics):
+        extr = cam_extrinsics[key]
+        colmap_image_name = os.path.splitext(os.path.basename(extr.name))[0]
+        image_dir = os.path.join(images_folder, colmap_image_name)
+        
+        if os.path.isdir(image_dir):
+            frame_files = sorted(glob(os.path.join(image_dir, "*.png")) + 
+                                glob(os.path.join(image_dir, "*.jpg")) +
+                                glob(os.path.join(image_dir, "*.jpeg")))
+            if frame_files:
+                video_folders_info[colmap_image_name] = frame_files
+                total_video_frames = max(total_video_frames, len(frame_files))
+    
+    # Use total_video_frames for fid calculation if video mode, else use num_extrinsics
+    num_frames_for_fid = total_video_frames if total_video_frames > 0 else len(cam_extrinsics)
+    fid_denominator = max(1, num_frames_for_fid - 1)
+    
     for idx, key in enumerate(sorted(cam_extrinsics)):
         sys.stdout.write('\r')
-        # the exact output you're looking for:
-        sys.stdout.write(
-            "Reading camera {}/{}".format(idx + 1, len(cam_extrinsics)))
+        sys.stdout.write("Reading camera {}/{}".format(idx + 1, len(cam_extrinsics)))
         sys.stdout.flush()
 
         extr = cam_extrinsics[key]
@@ -196,37 +226,102 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, masks_folde
         else:
             assert False, "Colmap camera model not handled: only undistorted datasets (PINHOLE or SIMPLE_PINHOLE cameras) supported!"
 
-        image_path = os.path.join(images_folder, os.path.basename(extr.name))
-        image_name = os.path.basename(image_path).split(".")[0]
-        image = Image.open(image_path)
-        if masks_folder is not None:
-            mask_name = extr.name[1:]
-            mask_path = os.path.join(masks_folder, mask_name)
-            mask = Image.open(mask_path)
-            im_data = np.array(image.convert("RGBA"))
-
-            bg = np.array([1, 1, 1]) if white_background else np.array([0, 0, 0])
-
-            norm_data = im_data / 255.0
-            mask = norm_data[..., 3:4]
-
-            arr = norm_data[:, :, :3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
-            image = Image.fromarray(np.array(arr * 255.0, dtype=np.byte), "RGB")
-        else:
-            mask = None
-
-        # Robust timestamp parsing: extract frame index from image name
-        # Handles hierarchical paths like "cam01/frame_00010" by finding the last number sequence
-        number_sequences = re.findall(r'(\d+)', image_name)
-        if number_sequences:
-            frame_index = int(number_sequences[-1])  # Use the last number found
-            fid = frame_index / fid_denominator
-        else:
-            fid = 0
+        # Get the pure name from COLMAP extrinsic (e.g., "image01")
+        colmap_image_name = os.path.splitext(os.path.basename(extr.name))[0]
         
-        cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                              image_path=image_path, image_name=image_name, width=width, height=height, fid=fid, mask=mask)
-        cam_infos.append(cam_info)
+        # Check if a folder with this name exists in the images_folder
+        image_dir = os.path.join(images_folder, colmap_image_name)
+        
+        if os.path.isdir(image_dir):
+            # === VIDEO EXPANSION MODE ===
+            # Load all frames in the folder (e.g., frame_00001.png, frame_00002.png)
+            frame_files = sorted(glob(os.path.join(image_dir, "*.png")) + 
+                                glob(os.path.join(image_dir, "*.jpg")) +
+                                glob(os.path.join(image_dir, "*.jpeg")))
+            
+            if not frame_files:
+                print(f"\n  Warning: Video folder {image_dir} is empty, skipping...")
+                continue
+            
+            for frame_path in frame_files:
+                frame_basename = os.path.basename(frame_path)
+                frame_name = os.path.splitext(frame_basename)[0]
+                
+                # Robust FID (Time) Parsing from "frame_00001"
+                matches = re.findall(r'(\d+)', frame_name)
+                fid = 0.0
+                if matches:
+                    frame_index = int(matches[-1])
+                    fid = frame_index / fid_denominator
+                
+                # Construct unique hierarchical image name: "image01/frame_00001"
+                unique_image_name = f"{colmap_image_name}/{frame_name}"
+                
+                # Load the image
+                image = Image.open(frame_path)
+                
+                # Handle masks if provided
+                mask = None
+                if masks_folder is not None:
+                    mask_path = os.path.join(masks_folder, colmap_image_name, frame_basename)
+                    if os.path.exists(mask_path):
+                        mask_img = Image.open(mask_path)
+                        im_data = np.array(image.convert("RGBA"))
+                        bg = np.array([1, 1, 1]) if white_background else np.array([0, 0, 0])
+                        norm_data = im_data / 255.0
+                        mask = norm_data[..., 3:4]
+                        arr = norm_data[:, :, :3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
+                        image = Image.fromarray(np.array(arr * 255.0, dtype=np.byte), "RGB")
+                
+                # Create CameraInfo (Reuse R, T, K from the static COLMAP view)
+                cam_info = CameraInfo(
+                    uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
+                    image_path=frame_path, image_name=unique_image_name, 
+                    width=width, height=height, fid=fid, mask=mask
+                )
+                cam_infos.append(cam_info)
+        else:
+            # === SINGLE IMAGE MODE (backward compatible) or SKIP EXTRA VIEWS ===
+            # Check if single image file exists
+            single_image_path = os.path.join(images_folder, os.path.basename(extr.name))
+            
+            if os.path.exists(single_image_path):
+                # Single image mode - backward compatible
+                image_name = os.path.splitext(os.path.basename(single_image_path))[0]
+                image = Image.open(single_image_path)
+                
+                mask = None
+                if masks_folder is not None:
+                    mask_name = extr.name[1:] if extr.name.startswith('/') else extr.name
+                    mask_path = os.path.join(masks_folder, mask_name)
+                    if os.path.exists(mask_path):
+                        mask_img = Image.open(mask_path)
+                        im_data = np.array(image.convert("RGBA"))
+                        bg = np.array([1, 1, 1]) if white_background else np.array([0, 0, 0])
+                        norm_data = im_data / 255.0
+                        mask = norm_data[..., 3:4]
+                        arr = norm_data[:, :, :3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
+                        image = Image.fromarray(np.array(arr * 255.0, dtype=np.byte), "RGB")
+                
+                # Robust timestamp parsing
+                number_sequences = re.findall(r'(\d+)', image_name)
+                if number_sequences:
+                    frame_index = int(number_sequences[-1])
+                    fid = frame_index / fid_denominator
+                else:
+                    fid = 0
+                
+                cam_info = CameraInfo(
+                    uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
+                    image_path=single_image_path, image_name=image_name, 
+                    width=width, height=height, fid=fid, mask=mask
+                )
+                cam_infos.append(cam_info)
+            else:
+                # Skip extra views that don't have video folders or single images
+                print(f"\n  Skipping COLMAP view '{colmap_image_name}' - no matching video folder or image file")
+                continue
+    
     sys.stdout.write('\n')
     return cam_infos
 
