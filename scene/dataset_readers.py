@@ -166,6 +166,8 @@ def getNerfppNorm(cam_info):
 def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, masks_folder=None, white_background=False):
     cam_infos = []
     num_frames = len(cam_extrinsics)
+    # Pre-compute the denominator for fid calculation (avoid redundant computation in loop)
+    fid_denominator = max(1, num_frames - 1)
     for idx, key in enumerate(sorted(cam_extrinsics)):
         sys.stdout.write('\r')
         # the exact output you're looking for:
@@ -218,7 +220,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, masks_folde
         number_sequences = re.findall(r'(\d+)', image_name)
         if number_sequences:
             frame_index = int(number_sequences[-1])  # Use the last number found
-            fid = frame_index / max(1, num_frames - 1)
+            fid = frame_index / fid_denominator
         else:
             fid = 0
         
