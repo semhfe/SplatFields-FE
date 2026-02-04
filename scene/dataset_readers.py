@@ -407,29 +407,29 @@ def readColmapSceneInfoSparse(path, images, eval, white_background, llffhold=8, 
     """
     cam_infos_unsorted, _cam_pose = read_colmap_poses(path, images, white_background)
     
-    # Build a mapping from image_name to camera info for efficient lookup
-    cam_info_by_name = {cam.image_name: cam for cam in cam_infos_unsorted}
-    
     train_cam_infos, test_cam_infos = [], []
     
     # Check if explicit camera names are provided
     if train_cam_names is not None and len(train_cam_names) > 0:
-        # Use explicit camera name filtering - DO NOT truncate with n_views
-        print(f"Using explicit camera name filtering with {len(train_cam_names)} cameras: {train_cam_names}")
+        # Use explicit camera name filtering with prefix matching for hierarchical names
+        # e.g., train_cam_names=["image01"] will match "image01/frame_00001", "image01/frame_00002", etc.
+        print(f"Using explicit camera name filtering with {len(train_cam_names)} camera prefixes: {train_cam_names}")
         
-        for cam_name in train_cam_names:
-            if cam_name in cam_info_by_name:
-                train_cam_infos.append(cam_info_by_name[cam_name])
-            else:
-                print(f"Warning: Camera '{cam_name}' not found in dataset. Available cameras: {list(cam_info_by_name.keys())}")
+        def matches_train_cam(image_name, train_names):
+            """Check if image_name starts with any of the train camera name prefixes."""
+            for prefix in train_names:
+                if image_name.startswith(prefix):
+                    return True
+            return False
         
-        # All cameras not in train_cam_names go to test set
-        train_cam_name_set = set(train_cam_names)
+        # Filter cameras based on prefix matching
         for cam in cam_infos_unsorted:
-            if cam.image_name not in train_cam_name_set:
+            if matches_train_cam(cam.image_name, train_cam_names):
+                train_cam_infos.append(cam)
+            else:
                 test_cam_infos.append(cam)
         
-        print(f'Training cameras (by name): {[c.image_name for c in train_cam_infos]}')
+        print(f'Training cameras (by prefix match): {[c.image_name for c in train_cam_infos[:10]]}{"..." if len(train_cam_infos) > 10 else ""}')
     else:
         # Fallback: Use n_views based subsampling (default behavior)
         # Use kmeans-based selection for better camera distribution
