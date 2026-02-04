@@ -11,6 +11,7 @@
 
 import os
 import sys
+import re
 import trimesh
 import torch
 import tempfile
@@ -212,10 +213,15 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, masks_folde
         else:
             mask = None
 
-        try:
-            fid = int(image_name) / (num_frames - 1)
-        except:
+        # Robust timestamp parsing: extract frame index from image name
+        # Handles hierarchical paths like "cam01/frame_00010" by finding the last number sequence
+        number_sequences = re.findall(r'(\d+)', image_name)
+        if number_sequences:
+            frame_index = int(number_sequences[-1])  # Use the last number found
+            fid = frame_index / max(1, num_frames - 1)
+        else:
             fid = 0
+        
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
                               image_path=image_path, image_name=image_name, width=width, height=height, fid=fid, mask=mask)
         cam_infos.append(cam_info)
