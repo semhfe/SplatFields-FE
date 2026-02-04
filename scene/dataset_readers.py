@@ -277,50 +277,102 @@ def read_colmap_poses(path, images, white_background):
     cam_pos = np.stack(camera_pose)
     return cam_infos_unsorted, cam_pos
 
-def readColmapSceneInfoSparse(path, images, eval, white_background, llffhold=8, num_pts=300_000, pc_path='', load_time_step=10000, load_every_nth=-1, n_views=6):
+def readColmapSceneInfoSparse(path, images, eval, white_background, llffhold=8, num_pts=300_000, pc_path='', load_time_step=10000, load_every_nth=-1, n_views=6, train_cam_names=None):
+    """
+    Read Colmap scene info with support for explicit camera name filtering.
+    
+    Args:
+        path: Path to the dataset.
+        images: Images folder name.
+        eval: Whether to use eval mode.
+        white_background: Use white background for images.
+        llffhold: LLFF holdout value for train/test split.
+        num_pts: Number of points to subsample.
+        pc_path: Path to external point cloud file (optional).
+        load_time_step: Maximum time step to load.
+        load_every_nth: Load every nth image.
+        n_views: Number of views for default subsampling (used only when train_cam_names is not provided).
+        train_cam_names: List of camera names to use for training (optional). 
+                         When provided and non-empty, ONLY these cameras are used for training,
+                         ignoring n_views parameter.
+    """
     cam_infos_unsorted, _cam_pose = read_colmap_poses(path, images, white_background)
-    # pixel nerf split
-    train_idx = [25, 22, 28, 40, 44, 48, 0, 8, 13]
-    exclude_idx = [3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 36, 37, 38, 39]
-    test_idx = [i for i in np.arange(49) if i not in train_idx + exclude_idx]
-    split_indices = {'test': test_idx, 'train': train_idx}
-
-    # selected_idxs = sorted(kmeans_downsample(_cam_pose, n_views))
-    selected_idxs = split_indices['train'][:n_views]
-    print('training camera ids', selected_idxs, ':', [cam_infos_unsorted[c].image_name for c in selected_idxs])
-
+    
+    # Build a mapping from image_name to camera info for efficient lookup
+    cam_info_by_name = {cam.image_name: cam for cam in cam_infos_unsorted}
+    
     train_cam_infos, test_cam_infos = [], []
-    for ind in range(len(cam_infos_unsorted)):
-        if ind in selected_idxs:
-            train_cam_infos.append(cam_infos_unsorted[ind])
-        elif ind in test_idx:
-            test_cam_infos.append(cam_infos_unsorted[ind])
+    
+    # Check if explicit camera names are provided
+    if train_cam_names is not None and len(train_cam_names) > 0:
+        # Use explicit camera name filtering - DO NOT truncate with n_views
+        print(f"Using explicit camera name filtering with {len(train_cam_names)} cameras: {train_cam_names}")
+        
+        for cam_name in train_cam_names:
+            if cam_name in cam_info_by_name:
+                train_cam_infos.append(cam_info_by_name[cam_name])
+            else:
+                print(f"Warning: Camera '{cam_name}' not found in dataset. Available cameras: {list(cam_info_by_name.keys())}")
+        
+        # All cameras not in train_cam_names go to test set
+        train_cam_name_set = set(train_cam_names)
+        for cam in cam_infos_unsorted:
+            if cam.image_name not in train_cam_name_set:
+                test_cam_infos.append(cam)
+        
+        print(f'Training cameras (by name): {[c.image_name for c in train_cam_infos]}')
+    else:
+        # Fallback: Use n_views based subsampling (default behavior)
+        # Use kmeans-based selection for better camera distribution
+        if n_views > 0 and n_views < len(cam_infos_unsorted):
+            selected_idxs = sorted(kmeans_downsample(_cam_pose, n_views))
+        else:
+            selected_idxs = list(range(len(cam_infos_unsorted)))
+        
+        print('training camera ids', selected_idxs, ':', [cam_infos_unsorted[c].image_name for c in selected_idxs if c < len(cam_infos_unsorted)])
+        
+        for ind in range(len(cam_infos_unsorted)):
+            if ind in selected_idxs:
+                train_cam_infos.append(cam_infos_unsorted[ind])
+            else:
+                test_cam_infos.append(cam_infos_unsorted[ind])
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
     ply_path = os.path.join(path, "sparse/0/points3D.ply")
     bin_path = os.path.join(path, "sparse/0/points3D.bin")
     txt_path = os.path.join(path, "sparse/0/points3D.txt")
-    if pc_path is not None and pc_path != '':
-        assert os.path.exists(pc_path), f"Path {pc_path} does not exist"
+    
+    # Robust point cloud loading
+    if pc_path is not None and pc_path != '' and os.path.exists(pc_path):
+        # Load external point cloud
+        print(f"Loading point cloud from external path: {pc_path}")
         xyz = np.asarray(trimesh.load(pc_path).vertices)
         # remove points that are outside -1,1 range
         xyz = xyz[np.all(np.abs(xyz) < 1, axis=1)]
-        # subsample vertices to 100000 points
+        # subsample vertices to num_pts points
         if num_pts > 0 and xyz.shape[0] > num_pts:
             xyz = xyz[np.random.choice(xyz.shape[0], num_pts, replace=False)]
         colors = np.random.random((xyz.shape[0], 3)) / 255.0
     else:
-        print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+        # Try to load standard Colmap point cloud files
+        print("Loading point cloud from standard Colmap files...")
         try:
-            xyz, colors, _ = read_points3D_binary(bin_path)
-        except:
-            xyz, colors, _ = read_points3D_text(txt_path)
-        # storePly(ply_path, xyz, rgb)
-    # try:
-    #     pcd = fetchPly(ply_path)
-    # except:
-    #     pcd = None
+            if os.path.exists(bin_path):
+                xyz, colors, _ = read_points3D_binary(bin_path)
+                print(f"Loaded {len(xyz)} points from points3D.bin")
+            elif os.path.exists(txt_path):
+                xyz, colors, _ = read_points3D_text(txt_path)
+                print(f"Loaded {len(xyz)} points from points3D.txt")
+            else:
+                raise FileNotFoundError(f"No Colmap points3D file found at {bin_path} or {txt_path}")
+        except Exception as e:
+            print(f"Warning: Could not load standard Colmap point cloud: {e}")
+            # If external pc_path was provided but doesn't exist, raise error
+            if pc_path is not None and pc_path != '':
+                raise FileNotFoundError(f"External point cloud path specified but does not exist: {pc_path}")
+            raise
+    
     pcd = BasicPointCloud(points=xyz, colors=colors, normals=np.zeros_like(xyz))
     storePly(ply_path, xyz, colors)
     pcd = fetchPly(ply_path)
